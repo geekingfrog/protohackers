@@ -1,7 +1,7 @@
 use tokio::io::{AsyncWriteExt, AsyncReadExt};
 use tokio::net::{TcpListener, TcpStream};
 
-type BoxResult<T> = Result<T, Box<dyn std::error::Error>>;
+type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
 #[tokio::main]
 pub async fn main() -> BoxResult<()> {

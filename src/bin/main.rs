@@ -10,13 +10,15 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Command {
     Echo,
+    Prime,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
 
     match Cli::parse().command {
         Command::Echo => protohacker::echo::main()?,
+        Command::Prime => protohacker::prime::main()?,
     }
 
     Ok(())

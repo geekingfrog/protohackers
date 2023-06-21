@@ -38,21 +38,21 @@ pub async fn main() -> BoxResult<()> {
 async fn prime(stream: TcpStream) -> BoxResult<()> {
     let (rdr, mut wrt) = stream.into_split();
     let rdr = tokio::io::BufReader::new(rdr);
-    let mut lines = rdr.lines();
+    let mut lines = rdr.split(0x0A);
 
-    while let Some(line) = lines.next_line().await? {
-        if line.is_empty() {
+    while let Some(slice) = lines.next_segment().await? {
+        if slice.is_empty() {
             continue;
         }
 
-        match process_request(&line) {
+        match process_request(&slice) {
             Ok(res) => {
                 let resp = serde_json::to_vec(&Response::IsPrime(res)).unwrap();
                 wrt.write_all(&resp[..]).await?;
                 wrt.write(&[0x0A]).await?;
             }
             Err(err) => {
-                tracing::info!("Invalid request received for {err:?} - {line}");
+                tracing::info!("Invalid request received for {err:?} - {:?}", std::str::from_utf8(&slice));
                 wrt.write_all(b"error").await?;
                 wrt.shutdown().await?;
                 return Ok(());
@@ -64,8 +64,8 @@ async fn prime(stream: TcpStream) -> BoxResult<()> {
     Ok(())
 }
 
-fn process_request(slice: &str) -> BoxResult<bool> {
-    let request: Request = serde_json::from_str(slice)?;
+fn process_request(slice: &[u8]) -> BoxResult<bool> {
+    let request: Request = serde_json::from_slice(slice)?;
     tracing::info!("processing request {request:?}");
     let n = match request {
         Request::IsPrime(n) => n,

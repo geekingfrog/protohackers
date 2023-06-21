@@ -13,6 +13,7 @@ enum Command {
     Prime,
     Mean,
     Chat,
+    KVDB,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -23,6 +24,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Prime => protohacker::prime::main()?,
         Command::Mean => protohacker::mean::main()?,
         Command::Chat => protohacker::chat::main()?,
+        Command::KVDB => protohacker::kvdb::main()?,
     }
 
     Ok(())

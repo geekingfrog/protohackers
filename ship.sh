@@ -2,4 +2,4 @@
 
 set -euo pipefail
 cargo build --release
-rsync target/release/protohacker linode:~/
+rsync --progress target/release/protohacker linode:~/

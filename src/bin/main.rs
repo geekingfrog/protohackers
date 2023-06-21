@@ -11,6 +11,7 @@ struct Cli {
 enum Command {
     Echo,
     Prime,
+    Mean,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -19,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match Cli::parse().command {
         Command::Echo => protohacker::echo::main()?,
         Command::Prime => protohacker::prime::main()?,
+        Command::Mean => protohacker::mean::main()?,
     }
 
     Ok(())

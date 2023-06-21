@@ -12,6 +12,7 @@ enum Command {
     Echo,
     Prime,
     Mean,
+    Chat,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -21,6 +22,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Echo => protohacker::echo::main()?,
         Command::Prime => protohacker::prime::main()?,
         Command::Mean => protohacker::mean::main()?,
+        Command::Chat => protohacker::chat::main()?,
     }
 
     Ok(())

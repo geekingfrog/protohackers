@@ -1,11 +1,11 @@
-use tokio::io::{AsyncWriteExt, AsyncReadExt};
+use std::net::SocketAddr;
+
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
 type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-#[tokio::main]
-pub async fn main() -> BoxResult<()> {
-    let addr = "0.0.0.0:6789";
+pub async fn main(addr: SocketAddr) -> BoxResult<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("listening on {addr}");
 
@@ -28,6 +28,7 @@ async fn echo(mut stream: TcpStream) -> BoxResult<()> {
         if read == 0 {
             break;
         }
+        tracing::debug!("echoing data: {:?}", std::str::from_utf8(&buf[0..read]));
         stream.write_all(&buf[0..read]).await?;
     }
     stream.shutdown().await?;

@@ -18,3 +18,6 @@ tracing-subscriber = { version = "0.3.17", features = ["env-filter"] }
 [[bin]]
 name = "protohacker"
 path = "src/bin/main.rs"
+
+[dev-dependencies]
+pretty_assertions = "1.3.0"

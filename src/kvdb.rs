@@ -1,12 +1,10 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, net::SocketAddr};
 
 use tokio::net::UdpSocket;
 
 type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-#[tokio::main]
-pub async fn main() -> BoxResult<()> {
-    let addr = "0.0.0.0:6789";
+pub async fn main(addr: SocketAddr) -> BoxResult<()> {
     let socket = UdpSocket::bind(addr).await?;
     tracing::info!("listening on {addr}");
 

@@ -3,6 +3,9 @@ use protohacker;
 
 #[derive(Parser, Debug)]
 struct Cli {
+    #[arg(long, default_value_t = 6789)]
+    port: u16,
+
     #[command(subcommand)]
     command: Command,
 }
@@ -16,15 +19,18 @@ enum Command {
     KVDB,
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     tracing_subscriber::fmt::init();
+    let cli = Cli::parse();
+    let addr = ([0, 0, 0, 0], cli.port).into();
 
-    match Cli::parse().command {
-        Command::Echo => protohacker::echo::main()?,
-        Command::Prime => protohacker::prime::main()?,
-        Command::Mean => protohacker::mean::main()?,
-        Command::Chat => protohacker::chat::main()?,
-        Command::KVDB => protohacker::kvdb::main()?,
+    match cli.command {
+        Command::Echo => protohacker::echo::main(addr).await?,
+        Command::Prime => protohacker::prime::main(addr).await?,
+        Command::Mean => protohacker::mean::main(addr).await?,
+        Command::Chat => protohacker::chat::main(addr).await?,
+        Command::KVDB => protohacker::kvdb::main(addr).await?,
     }
 
     Ok(())

@@ -1,3 +1,5 @@
+use std::net::SocketAddr;
+
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -17,9 +19,7 @@ enum Response {
     IsPrime(bool),
 }
 
-#[tokio::main]
-pub async fn main() -> BoxResult<()> {
-    let addr = "0.0.0.0:6789";
+pub async fn main(addr: SocketAddr) -> BoxResult<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("listening on {addr}");
 

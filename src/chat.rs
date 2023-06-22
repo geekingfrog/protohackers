@@ -1,4 +1,5 @@
 use std::collections::BTreeMap;
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use futures::{stream, StreamExt};
@@ -9,9 +10,7 @@ use tokio::sync::Mutex;
 
 type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-#[tokio::main]
-pub async fn main() -> BoxResult<()> {
-    let addr = "0.0.0.0:6789";
+pub async fn main(addr: SocketAddr) -> BoxResult<()> {
     let listener = TcpListener::bind(addr).await?;
     tracing::info!("listening on {addr}");
 

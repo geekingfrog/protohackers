@@ -17,6 +17,7 @@ enum Command {
     Mean,
     Chat,
     KVDB,
+    MITM,
 }
 
 #[tokio::main]
@@ -31,6 +32,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Mean => protohacker::mean::main(addr).await?,
         Command::Chat => protohacker::chat::main(addr).await?,
         Command::KVDB => protohacker::kvdb::main(addr).await?,
+        Command::MITM => protohacker::mitm::main(addr).await?,
     }
 
     Ok(())

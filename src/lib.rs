@@ -4,3 +4,4 @@ pub mod mean;
 pub mod chat;
 pub mod kvdb;
 pub mod mitm;
+pub mod speed;

@@ -35,12 +35,12 @@ pub async fn main(addr: SocketAddr) -> BoxResult<()> {
 struct Server {
     roads: BTreeMap<u16, u16>,
     // keep track of tickets sent to (plate, date)
-    sent_tickets: BTreeSet<(String, Date)>,
+    sent_tickets: BTreeMap<String, BTreeSet<(u16, Date)>>,
     // tickets we should send but no available dispatcher for them yet
-    waiting_tickets: Vec<(Ticket, Date)>,
+    waiting_tickets: Vec<Ticket>,
     dispatchers: Vec<(Vec<u16>, Arc<MessageWriter>)>,
-    /// plate spotted at, indexed by the road ID
-    plates: BTreeMap<u16, Vec<PlateSight>>,
+    /// plate spotted at, indexed by the (road ID, plate)
+    plates: BTreeMap<(u16, String), Vec<PlateSight>>,
     server_receiver: Receiver<ServerMessage>,
     // to be cloned and given to new clients to give them a way
     // to communicate with the central server.
@@ -112,9 +112,9 @@ impl Server {
                     self.send_tickets().await?;
                 }
                 ServerMessage::PlateSight(ps) => {
-                    let entry = self.plates.entry(ps.road).or_default();
+                    let entry = self.plates.entry((ps.road, ps.name.clone())).or_default();
                     entry.push(ps);
-                    entry.sort_unstable_by_key(|s| s.mile);
+                    entry.sort_unstable_by_key(|s| s.timestamp);
                     self.send_tickets().await?;
                 }
             }
@@ -127,12 +127,10 @@ impl Server {
 
     async fn send_tickets(&mut self) -> BoxResult<()> {
         let tickets = self.get_tickets();
-        // TODO: once we get the list of tickets to send, we may want to clear
-        // some of the plate sights
 
         let mut holdover_tickets = Vec::new();
 
-        for (ticket, date) in tickets {
+        for ticket in tickets {
             let dispatcher = self.dispatchers.iter().find_map(|(roads, wrt)| {
                 if roads.contains(&ticket.road) {
                     Some(wrt)
@@ -141,27 +139,25 @@ impl Server {
                 }
             });
 
-            self.plates.entry(ticket.road).and_modify(|ps| {
-                // because Vec::drain_filter isn't in stable yet
-                let mut i = 0;
-                while i < ps.len() {
-                    tracing::trace!("clearing plate {:?}", ps[i]);
-                    if ps[i].name == ticket.plate {
-                        ps.remove(i);
-                    } else {
-                        i += 1;
-                    }
-                }
-            });
+            // TODO: remove plates at some point
 
+            let plate = ticket.plate.clone();
             match dispatcher {
                 Some(wrt) => {
-                    self.sent_tickets.insert((ticket.plate.clone(), date));
-                    wrt.send(Message::Ticket(ticket)).await?;
+                    if self.should_send_ticket(&ticket) {
+                        let mut d = ticket.timestamp1.date();
+                        let e = self.sent_tickets.entry(plate.clone()).or_default();
+                        while d <= ticket.timestamp2.date() {
+                            e.insert((ticket.road, d));
+                            d += 1.days();
+                        }
+                        tracing::info!("sending {ticket:?}");
+                        wrt.send(Message::Ticket(ticket)).await?;
+                    }
                 }
                 None => {
                     tracing::info!("No dispatcher available for {ticket:?}");
-                    holdover_tickets.push((ticket, date));
+                    holdover_tickets.push(ticket);
                 }
             }
         }
@@ -171,40 +167,51 @@ impl Server {
     }
 
     /// compute the tickets to be sent based on the current plate sightings
-    fn get_tickets(&self) -> Vec<(Ticket, Date)> {
+    fn get_tickets(&self) -> Vec<Ticket> {
         let mut tickets = self.waiting_tickets.clone();
 
-        for (road, plate_sights) in self.plates.iter() {
+        for ((road, plate), plate_sights) in self.plates.iter() {
             let limit = *self.roads.get(road).unwrap() as i64;
             for (s1, s2) in std::iter::zip(plate_sights, plate_sights.iter().skip(1)) {
-                let d = s2.mile.checked_sub(s1.mile).expect("sorted by distances");
+                let d = if s2.mile > s1.mile {
+                    s2.mile - s1.mile
+                } else {
+                    s1.mile - s2.mile
+                };
                 let t = s2.timestamp - s1.timestamp;
-                let speed = (d as i64 * 3600) / t.whole_seconds();
-                if speed > limit {
+                let speed = (d as i64 * 3600 * 100) / t.whole_seconds();
+                if speed > limit * 100 {
                     let ticket = Ticket {
-                        plate: s1.name.clone(),
+                        plate: plate.clone(),
                         road: *road,
                         mile1: s1.mile,
                         timestamp1: s1.timestamp.clone(),
                         mile2: s2.mile,
                         timestamp2: s2.timestamp.clone(),
-                        speed: u16::try_from(speed * 100)
+                        speed: u16::try_from(speed)
                             .expect(&format!("No overflow on speed {speed}")),
                     };
-                    let mut d = s1.timestamp.date();
-                    while d <= s2.timestamp.date() {
-                        if self.sent_tickets.contains(&(ticket.plate.clone(), d)) {
-                            tracing::debug!("already sent a ticket to {} for {}", ticket.plate, d);
-                        } else {
-                            tracing::info!("new ticket to send: ({ticket:?}, {d})");
-                            tickets.push((ticket.clone(), d.clone()));
-                            d += 1.days();
-                        }
-                    }
+                    tickets.push(ticket);
                 }
             }
         }
         tickets
+    }
+
+    fn should_send_ticket(&self, ticket: &Ticket) -> bool {
+        let mut d = ticket.timestamp1.date();
+        while d <= ticket.timestamp2.date() {
+            let already_sent = self
+                .sent_tickets
+                .get(&ticket.plate)
+                .map(|roads_and_dates| roads_and_dates.contains(&(ticket.road, d)))
+                .unwrap_or(false);
+            if already_sent {
+                return false;
+            }
+            d += 1.days();
+        }
+        true
     }
 }
 
@@ -218,7 +225,7 @@ impl UnknownClient {
         let addr = self.stream.peer_addr().expect("can get peer addr");
         tokio::spawn(async move {
             match self.run().await {
-                Ok(()) => tracing::info!("Done with {addr}"),
+                Ok(()) => (),
                 Err(err) => tracing::info!("{addr} crashed: {err:?}"),
             }
         });
@@ -227,13 +234,15 @@ impl UnknownClient {
     async fn run(self) -> BoxResult<()> {
         let peer_addr = self.stream.peer_addr().expect("get peer address");
         let (rdr_stream, wrt_stream) = self.stream.into_split();
+        // let rdr_stream =
+        //     tokio_util::io::InspectReader::new(rdr_stream, |x| tracing::debug!("read {x:x?}"));
         let mut reader = MessageReader::new(rdr_stream);
         let wrt = Arc::new(MessageWriter::new(wrt_stream));
         let mut heartbeat_handle = None;
 
-        while let Some(message) = reader.next_message().await? {
+        while let Some(message) = reader.next_message().await.transpose() {
             match message {
-                Message::IAmCamera { road, mile, limit } => {
+                Ok(Message::IAmCamera { road, mile, limit }) => {
                     self.server_chan
                         .send(ServerMessage::RegisterCamera { road, limit })
                         .await?;
@@ -250,7 +259,7 @@ impl UnknownClient {
                     camera.spawn_run();
                     return Ok(());
                 }
-                Message::IAmDispatcher { roads } => {
+                Ok(Message::IAmDispatcher { roads }) => {
                     let id: String = itertools::intersperse(
                         roads.iter().map(|x| format!("{x}")),
                         ",".to_string(),
@@ -271,7 +280,7 @@ impl UnknownClient {
                     dispatcher.spawn_run();
                     return Ok(());
                 }
-                Message::WantHeartbeat { interval } => {
+                Ok(Message::WantHeartbeat { interval }) => {
                     handle_heartbeat(&mut heartbeat_handle, &wrt, interval).await?;
                 }
                 _ => {
@@ -321,9 +330,9 @@ impl Camera {
     }
 
     async fn run(&mut self) -> BoxResult<()> {
-        while let Some(msg) = self.rdr.next_message().await? {
-            match msg {
-                Message::Plate { name, timestamp } => {
+        while let Some(parsed) = self.rdr.next_message().await.transpose() {
+            match parsed {
+                Ok(Message::Plate { name, timestamp }) => {
                     let ps = PlateSight {
                         road: self.road,
                         mile: self.mile,
@@ -335,12 +344,12 @@ impl Camera {
                         .send(ServerMessage::PlateSight(ps))
                         .await?;
                 }
-                Message::WantHeartbeat { interval } => {
+                Ok(Message::WantHeartbeat { interval }) => {
                     handle_heartbeat(&mut self.heartbeat_handle, &self.wrt, interval).await?;
                 }
                 _ => {
                     tracing::error!(
-                        "Camera {}-{}-{} got invalid message {msg:?}",
+                        "Camera {}-{}-{} got invalid message {parsed:?}",
                         self.road,
                         self.mile,
                         self.limit
@@ -379,9 +388,9 @@ impl Dispatcher {
     }
 
     async fn run(&mut self) -> BoxResult<()> {
-        while let Some(msg) = self.rdr_stream.next_message().await? {
+        while let Some(msg) = self.rdr_stream.next_message().await.transpose() {
             match msg {
-                Message::WantHeartbeat { interval } => {
+                Ok(Message::WantHeartbeat { interval }) => {
                     handle_heartbeat(&mut self.heartbeat_handle, &self.wrt, interval).await?;
                 }
                 _ => {
@@ -435,9 +444,8 @@ impl MessageWriter {
                 }
             }
             tracing::info!("shutting down writing stream for {addr}");
-            if let Err(err) = wrt.shutdown().await {
-                tracing::warn!("Couldn't shutdown stream for {addr} - {err:?}");
-            }
+            // ignore the error, because the stream is probably already closed
+            let _ = wrt.shutdown().await;
         });
         MessageWriter { chan: sender }
     }
@@ -515,42 +523,44 @@ where
         Self { reader, buf }
     }
 
+    #[cfg(test)]
+    fn into_inner(self) -> R {
+        self.reader
+    }
+
     async fn next_message(&mut self) -> BoxResult<Option<Message>> {
         loop {
-            let mut tmp_buf = [0; 1024];
-            let n = self.reader.read(&mut tmp_buf).await?;
-            self.buf.extend_from_slice(&tmp_buf[0..n]);
-            if n == 0 && self.buf.len() == 0 {
-                tracing::trace!("no more messages");
-                return Ok(None);
-            }
-
-            if self.buf.len() > 0 {
-                match parser::message(&self.buf) {
-                    Ok((rest, command)) => {
-                        let consumed = self.buf.len() - rest.len();
-                        let _ = self.buf.split_to(consumed);
-                        tracing::trace!("got message: {command:?}");
-                        break Ok(Some(command));
-                    }
-                    Err(nom::Err::Incomplete(_)) => {
-                        // needs more bytes but the reader has reached its end, abort
-                        if n == 0 {
-                            tracing::trace!("unexpected EOF");
-                            return Err(parser::InvalidCommand::Nom(
-                                Bytes::new(),
-                                nom::error::ErrorKind::Eof,
-                            )
-                            .into());
-                        } else {
-                            continue;
+            match parser::message(&self.buf) {
+                Ok((rest, command)) => {
+                    let consumed = self.buf.len() - rest.len();
+                    let _ = self.buf.split_to(consumed);
+                    break Ok(Some(command));
+                }
+                Err(nom::Err::Error(err)) | Err(nom::Err::Failure(err)) => {
+                    tracing::trace!("parsing error {err:?}");
+                    break Err(err.to_owned().into());
+                }
+                Err(nom::Err::Incomplete(_)) => {
+                    let mut tmp_buf = [0; 1024];
+                    let n = self.reader.read(&mut tmp_buf).await?;
+                    if n == 0 {
+                        // reaching EOF and buffer is empty, meaning we're all done
+                        if self.buf.len() == 0 {
+                            break Ok(None);
                         }
+
+                        // needs more bytes but the reader has reached its end, abort
+                        tracing::trace!("unexpected EOF");
+                        break Err(parser::InvalidCommand::Nom(
+                            Bytes::new(),
+                            nom::error::ErrorKind::Eof,
+                        )
+                        .into());
+                    } else {
+                        self.buf.extend_from_slice(&tmp_buf[0..n]);
+                        continue;
                     }
-                    Err(nom::Err::Error(err)) | Err(nom::Err::Failure(err)) => {
-                        tracing::trace!("parsing error {err:?}");
-                        return Err(err.to_owned().into());
-                    }
-                };
+                }
             }
         }
     }
@@ -558,13 +568,17 @@ where
 
 #[cfg(test)]
 mod test {
+    use anyhow::{Context, Result};
     use std::io::Cursor;
+    use time::macros::datetime;
+    use tokio::{net::TcpListener, time::timeout};
 
     use super::*;
     use pretty_assertions::assert_eq;
 
     #[tokio::test]
     async fn test_parse_two_messages() {
+        let _ = tracing_subscriber::fmt::try_init();
         // camera
         let mut data = vec![0x80, 0x00, 0x42, 0x00, 0x64, 0x00, 0x3C];
         // want heartbeat
@@ -583,7 +597,128 @@ mod test {
             reader.next_message().await.expect("correct parse"),
             Some(Message::WantHeartbeat { interval: 10 })
         );
-        assert_eq!(reader.next_message().await.expect("correct parse"), None,);
+        assert_eq!(
+            reader.next_message().await.expect("correct parse"),
+            None,
+            "no more messages"
+        );
+    }
+
+    /// find a random available port and returns the tcp listener associated to it
+    async fn get_listener() -> TcpListener {
+        for port in 8000..9000 {
+            match TcpListener::bind(format!("127.0.0.1:{port}")).await {
+                Ok(l) => return l,
+                Err(_) => continue,
+            }
+        }
+        panic!("Couldn't find an available port !");
+    }
+
+    /// make sure to abort a task on drop, so that it's easier to
+    /// do assertion in tests with less worry about cleaning up
+    struct AbortHdl<T>(JoinHandle<T>);
+    impl<T> Drop for AbortHdl<T> {
+        fn drop(&mut self) {
+            self.0.abort()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_single_car() -> Result<()> {
+        let _ = tracing_subscriber::fmt::try_init();
+        let listener = get_listener().await;
+        let addr = listener.local_addr().unwrap();
+        let _hdl = AbortHdl(tokio::spawn(Server::new().run(listener)));
+        let road = 123;
+        let plate = "plate1".to_string();
+        let limit = 1;
+
+        let mut camera1 = TcpStream::connect(addr)
+            .await
+            .context("camera1 can connect")?;
+        camera1
+            .write_all(
+                &Message::IAmCamera {
+                    road,
+                    mile: 10,
+                    limit,
+                }
+                .to_bytes(),
+            )
+            .await?;
+
+        let mut dispatcher = TcpStream::connect(addr)
+            .await
+            .context("dispatcher can connect")?;
+        dispatcher
+            .write_all(&Message::IAmDispatcher { roads: vec![road] }.to_bytes())
+            .await?;
+        dispatcher.flush().await?;
+
+        let mut dispatcher = MessageReader::new(dispatcher);
+
+        camera1
+            .write_all(
+                &Message::Plate {
+                    name: plate.clone(),
+                    timestamp: datetime!(2023-01-01 3:00 UTC),
+                }
+                .to_bytes(),
+            )
+            .await?;
+        camera1.flush().await?;
+
+        let mut camera2 = TcpStream::connect(addr)
+            .await
+            .context("camera2 can connect")?;
+
+        camera2
+            .write_all(
+                &Message::IAmCamera {
+                    road,
+                    mile: 20,
+                    limit,
+                }
+                .to_bytes(),
+            )
+            .await?;
+
+        camera2
+            .write_all(
+                &Message::Plate {
+                    name: plate.clone(),
+                    // 10 miles in 1 minute = 600 m/h > limit = 100
+                    timestamp: datetime!(2023-01-01 3:01 UTC),
+                }
+                .to_bytes(),
+            )
+            .await?;
+        camera2.flush().await?;
+
+        let duration = Duration::from_millis(100);
+        let msg = match timeout(duration, dispatcher.next_message()).await {
+            Err(_) => panic!("expected a ticket but got nothing in {duration:?}"),
+            Ok(Ok(msg)) => msg,
+            Ok(x) => panic!("expecting a message but got {x:?}!"),
+        };
+
+        let ticket = Ticket {
+            plate: plate.clone(),
+            road,
+            mile1: 10,
+            timestamp1: datetime!(2023-01-01 3:00 UTC),
+            mile2: 20,
+            timestamp2: datetime!(2023-01-01 3:01 UTC),
+            speed: 60000,
+        };
+        assert_eq!(msg, Some(Message::Ticket(ticket)));
+
+        tracing::info!("tearing down test");
+        dispatcher.into_inner().shutdown().await?;
+        camera2.shutdown().await?;
+        camera1.shutdown().await?;
+        Ok(())
     }
 }
 
@@ -842,7 +977,7 @@ mod parser {
     }
 
     #[cfg(test)]
-    mod test {
+    mod test_parser {
         use super::*;
         use hex_literal::hex;
         use nom::Finish;

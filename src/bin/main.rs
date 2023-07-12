@@ -19,6 +19,7 @@ enum Command {
     KVDB,
     MITM,
     Speed,
+    Reversal,
 }
 
 #[tokio::main]
@@ -35,6 +36,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::KVDB => protohacker::kvdb::main(addr).await?,
         Command::MITM => protohacker::mitm::main(addr).await?,
         Command::Speed => protohacker::speed::main(addr).await?,
+        Command::Reversal => protohacker::reversal::main(addr).await?,
     }
 
     Ok(())

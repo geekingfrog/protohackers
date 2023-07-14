@@ -9,11 +9,10 @@ use std::{
 };
 
 use bytes::{BufMut, Bytes, BytesMut};
-use futures::{future::BoxFuture, Future, FutureExt};
-use pin_project::pin_project;
+use futures::{future::BoxFuture, FutureExt};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, BufReader, ReadBuf},
-    net::{ToSocketAddrs, UdpSocket},
+    net::UdpSocket,
     sync::mpsc::{self, Receiver, Sender},
     sync::oneshot,
     task::JoinHandle,
@@ -26,16 +25,61 @@ type BoxResult<T> = Result<T, BoxError>;
 const MAX_MESSAGE_LEN: usize = 1000;
 
 pub async fn main(addr: SocketAddr) -> BoxResult<()> {
-    // let sock = UdpSocket::bind(addr).await?;
-    // let mut buf = BytesMut::with_capacity(1024);
-    // buf.extend_from_slice(b"/connect/123456/");
-    // let stuff = buf.split().freeze();
-    // let stuff = std::str::from_utf8(&stuff).unwrap();
-    // println!("stuff: {stuff:?}");
-    // let parsed = parser::parse_message(&stuff);
-    // println!("{parsed:#?}");
-    Server::new(addr).await?.run().await?;
+    Server::bind(addr).await?.run().await?;
     Ok(())
+}
+
+// struct Clock {}
+
+/// similar to TcpStream, to send data using lrcp over udp
+#[derive(Debug)]
+struct LrcpStream {
+    tx: mpsc::Sender<SocketMessage>,
+}
+
+impl LrcpStream {
+    /// Create a LRCP socket connected to the given address and ready to send
+    /// and receive data from it
+    /// the session is the LRCP session number
+    async fn connect(peer_addr: SocketAddr, session: u32) -> BoxResult<LrcpStream> {
+        let (stream, mut conn) = LrcpStream::construct(peer_addr).await;
+        let local_addr = conn.sock.local_addr()?;
+        tracing::debug!("connecting to {peer_addr} from {}", local_addr);
+        conn.connect(session).await?;
+        conn.spawn_run();
+        Ok(stream)
+    }
+
+    /// low level, internal method used by `connect`. This doesn't spawn any tokio task
+    /// or attempt to initiate a connection
+    async fn construct(peer_addr: SocketAddr) -> (LrcpStream, Connection) {
+        let (_local_addr, socket) = get_socket().await;
+        let (tx, rx) = mpsc::channel(1);
+        let conn = Connection::new(socket, peer_addr, None, rx);
+        let stream = LrcpStream { tx };
+        (stream, conn)
+    }
+
+    fn construct_from_socket(
+        socket: Arc<UdpSocket>,
+        peer_addr: SocketAddr,
+        server_rx: Receiver<(Bytes, Instant)>,
+    ) -> (LrcpStream, Connection) {
+        let (tx, rx) = mpsc::channel(1);
+        let conn = Connection::new(socket, peer_addr, Some(server_rx), rx);
+        let stream = LrcpStream { tx };
+        (stream, conn)
+    }
+
+    fn split(self) -> (LrcpStreamRead, LrcpStreamWrite) {
+        (
+            LrcpStreamRead {
+                tx: self.tx.clone(),
+                fut: None,
+            },
+            LrcpStreamWrite { tx: self.tx },
+        )
+    }
 }
 
 struct Server {
@@ -43,15 +87,17 @@ struct Server {
 }
 
 impl Server {
-    /// binds to the given address
-    async fn new(addr: SocketAddr) -> BoxResult<Server> {
-        let sock = Arc::new(UdpSocket::bind(addr).await?);
-        Ok(Server { sock })
+    async fn bind<A>(bind_addr: A) -> BoxResult<Server>
+    where
+        A: tokio::net::ToSocketAddrs,
+    {
+        let sock = UdpSocket::bind(bind_addr).await?;
+        Ok(Server {
+            sock: Arc::new(sock),
+        })
     }
 
-    /// listen to the socket and manage connections: create, forward messages
-    /// and send timer events.
-    async fn run(&mut self) -> BoxResult<()> {
+    async fn run(&self) -> BoxResult<()> {
         let mut clients = BTreeMap::new();
         loop {
             // the spec says that LRCP messages must be smaller than 1000 bytes.
@@ -59,21 +105,22 @@ impl Server {
             // and act accordingly (shut down the peer)
             let mut buf = [0; MAX_MESSAGE_LEN + 1];
             let (n, peer_addr) = self.sock.recv_from(&mut buf).await?;
+            tracing::trace!("server got {n} bytes from {peer_addr}");
             if n == 0 {
                 continue;
             }
 
             let tx_conn = clients.entry(peer_addr).or_insert_with(|| {
-                let (conn, tx, _) = Connection::new(Arc::clone(&self.sock), peer_addr);
+                let (tx, rx) = mpsc::channel(10);
+                let (stream, conn) =
+                    LrcpStream::construct_from_socket(Arc::clone(&self.sock), peer_addr, rx);
                 conn.spawn_run();
+                Reversal::new(stream).spawn_run();
                 tx
             });
 
             if let Err(_) = tx_conn
-                .send(ServerMessage::SocketData {
-                    data: Bytes::copy_from_slice(&buf[0..n]),
-                    now: Instant::now(),
-                })
+                .send((Bytes::copy_from_slice(&buf[0..n]), Instant::now()))
                 .await
             {
                 // channel closed means the other side has dropped/closed, in this case
@@ -84,24 +131,35 @@ impl Server {
     }
 }
 
-#[derive(Debug)]
-enum ServerMessage {
-    SocketData { data: Bytes, now: Instant },
-    // Timer { time: Instant },
-}
-
-#[derive(Debug)]
+/// low level connection handling timeouts, retransmission and connection state
 struct Connection {
     sock: Arc<UdpSocket>,
-    msg_chan: Receiver<ServerMessage>,
+    peer_addr: SocketAddr,
+
+    /// when the connection is managed by a listener, it cannot simply call
+    /// sock.recv_from since this would potentially yield bytes from other
+    /// connections. In this case, the connection will be managed by the listener
+    /// which will poll the socket, and dispatch the received bytes through the
+    /// corresponding Sender.
+    /// For Connection created through `Connect`, they act as clients, and this
+    /// channel will be a dummy one, they can directly call sock.recv since they're bound
+    /// through sock.connect
+    /// Having it as an Option is messing the tokio::select! macro unfortunately :/
+    server_rx: mpsc::Receiver<(Bytes, Instant)>,
+    is_client_connection: bool,
+
     state: ConnectionState,
-    session: Option<u32>,
 
     /// The data received alongside an offset. Once the application
     /// has read some of it, it can be discarded, but the length of data
     /// should be preserved to keep the ACK position
     recv_buffer: BytesMut,
     recv_offset: u32,
+
+    /// when a high level stream request to read but there's nothing in the
+    /// recv_buffer and the connection isn't closing/closed, that means we need
+    /// to park the request for read until we get some data, and *then* we respond.
+    recv_chan: Option<(oneshot::Sender<Bytes>, usize)>,
 
     /// the data to send, along with an offset.
     /// Once the data we sent has been acknowledge, we can drop
@@ -111,76 +169,62 @@ struct Connection {
     send_buffer: BytesMut,
     sent_offset: u32,
 
-    peer_addr: SocketAddr,
-
     /// to communicate with a high level socket
     lrcp_socket_chan: Receiver<SocketMessage>,
 }
 
-#[derive(Debug, PartialEq)]
-enum ConnectionState {
-    Open,
-    Closed,
-}
-
-impl ConnectionState {
-    fn can_send(&self) -> bool {
-        matches!(self, ConnectionState::Open)
-    }
-}
-
 impl Connection {
-    /// The Connection can be used for spawn_run in its own tokio task.
-    /// The Sender<ServerMessage> is to communicate from the server and pass
-    /// bytes read from the socket + timer events
-    /// the LrcpSocket is the higher level abstraction that can be used
     fn new(
         sock: Arc<UdpSocket>,
         peer_addr: SocketAddr,
-    ) -> (Self, Sender<ServerMessage>, LrcpSocket) {
-        let (tx, msg_chan) = mpsc::channel(1);
-        let (lrcp_tx, lrcp_rx) = mpsc::channel(1);
-        let lrcp_socket = LrcpSocket { tx: lrcp_tx };
-        let conn = Connection {
+        server_rx: Option<Receiver<(Bytes, Instant)>>,
+        lrcp_socket_chan: mpsc::Receiver<SocketMessage>,
+    ) -> Self {
+        let is_client_connection = server_rx.is_none();
+        let server_rx = match server_rx {
+            Some(rx) => rx,
+            None => mpsc::channel(1).1,
+        };
+        Connection {
             sock,
-            msg_chan,
-            state: ConnectionState::Open,
-            session: None,
+            peer_addr,
+            server_rx,
+            is_client_connection,
+            state: ConnectionState::Opening,
             recv_buffer: BytesMut::new(),
             recv_offset: 0,
+            recv_chan: None,
             send_buffer: BytesMut::new(),
             sent_offset: 0,
-            peer_addr,
-            lrcp_socket_chan: lrcp_rx,
-        };
-        (conn, tx, lrcp_socket)
+            lrcp_socket_chan,
+        }
     }
 
-    /// to create a client to connect to a given server
-    /// this will bind and connect to the peer_addr, send the first Connect
-    /// message, and wait until it receive the corresponding ACK, with some
-    /// retry logic.
-    async fn connect(
-        sock: UdpSocket,
-        peer_addr: SocketAddr,
-        session: u32,
-    ) -> BoxResult<(Connection, Sender<ServerMessage>, LrcpSocket)> {
-        sock.connect(peer_addr).await?;
-        let sock = Arc::new(sock);
-        let (conn, tx, lrcp_socket) = Connection::new(Arc::clone(&sock), peer_addr);
+    /// attempt to establish a connection, sending the initial connect message
+    /// and waiting for the acknowledgement, retrying if necessary before giving up
+    /// This will also connect the socket to the peer_address
+    async fn connect(&mut self, session: u32) -> BoxResult<()> {
+        // so that sock.recv only gets stuff from the peer address
+        self.sock.connect(self.peer_addr).await?;
         let connect_msg = Message::Connect { session }.to_bytes();
+
+        if let ConnectionState::Open { .. } = self.state {
+            return Err("Cannot call `connect` on an already connected session".into());
+        }
 
         // do the handshake and wait for the ack
         let mut buf = [0; 40];
-        for _ in 0..3 {
-            sock.send_to(&connect_msg, peer_addr).await?;
-            match timeout(Duration::from_millis(1000), sock.recv(&mut buf)).await {
+        for i in 0..3 {
+            self.sock.send_to(&connect_msg, self.peer_addr).await?;
+            match timeout(Duration::from_millis(5000), self.sock.recv(&mut buf)).await {
                 Ok(n) => {
                     let n = n?;
                     let msg = parser::parse_message(&buf[0..n]).map_err(|e| e.clone_input())?;
                     match msg {
                         Message::Ack { session: s, len } if s == session && len == 0 => {
-                            return Ok((conn, tx, lrcp_socket));
+                            self.state = ConnectionState::Open { session };
+                            tracing::debug!("connection to {} is now opened", self.peer_addr);
+                            return Ok(());
                         }
                         _ => {
                             return Err(format!("Expected an initial ack but got {msg:?}").into());
@@ -188,14 +232,14 @@ impl Connection {
                     }
                 }
                 Err(_) => {
-                    tracing::trace!("timeout waiting for peer to ack CONNECT");
+                    tracing::trace!("timeout waiting for peer to ack CONNECT (attempt {i})");
                 }
             };
         }
         Err("timeout waiting for peer to answer connect message".into())
     }
 
-    // start the inner loop for the connection in its own async task
+    /// start the inner loop for the connection in its own async task
     fn spawn_run(self) -> JoinHandle<()> {
         let addr = self.peer_addr;
         tokio::task::spawn(async move {
@@ -207,36 +251,61 @@ impl Connection {
     }
 
     async fn run(mut self) -> BoxResult<()> {
-        tracing::debug!("starting connection for {}", self.peer_addr);
-        println!("starting connection for {}", self.peer_addr);
+        tracing::debug!("[{}] starting connection", self.peer_addr);
+        self.sock.connect(self.peer_addr).await?;
+
         let mut lrcp_sock_closed = false;
+        let mut buf = [0; MAX_MESSAGE_LEN + 1];
 
         loop {
             tokio::select! {
-                msg = self.msg_chan.recv() => {
-                    match msg {
-                        Some(ServerMessage::SocketData{data, now}) => {
-                            self.on_message(data, now).await?;
-                            if self.state == ConnectionState::Closed {
-                                break;
-                            }
-                        },
-                        None => {
-                            tracing::warn!("server channel is closed, shutting down the connection {}", self.peer_addr);
+                // no server_rx means that the connection is in client mode
+                // so calling sock.recv is guaranteed to read bytes intended for this socket.
+                stuff = self.sock.recv(&mut buf), if self.is_client_connection => {
+                    let len = match stuff {
+                        Ok(x) => x,
+                        Err(err) => {
+                            tracing::error!("Error reading socket data: {err:?}");
+                            self.state = ConnectionState::Closed;
                             break;
                         }
+                    };
+
+                    if len == 0 {
+                        break;
+                    };
+
+                    self.on_message(Bytes::copy_from_slice(&buf[..len])).await?;
+                    if let ConnectionState::Closed = self.state {
+                        break;
                     }
                 },
+                x = self.server_rx.recv(), if !self.is_client_connection => {
+                    let (bs, _now) = match x {
+                        Some(x) => x,
+                        None => {
+                            tracing::warn!("Connection managed by a server but it has dropped, closing");
+                            break
+                        }
+                    };
+                    if bs.is_empty() {
+                        break;
+                    }
+                    self.on_message(bs).await?;
+                    if let ConnectionState::Closed = self.state {
+                        break;
+                    }
+                }
                 msg = self.lrcp_socket_chan.recv(), if !lrcp_sock_closed => {
                     match msg {
                         Some(msg) => self.on_socket_message(msg).await?,
                         None => {
-                            tracing::trace!("lrcp socket chan is closed {}", self.peer_addr);
+                            tracing::trace!("[{}] lrcp socket chan is closed", self.peer_addr);
                             lrcp_sock_closed = true;
                             continue
                         },
                     }
-                }
+                },
             }
         }
 
@@ -244,23 +313,25 @@ impl Connection {
         Ok(())
     }
 
-    async fn on_message(&mut self, raw: Bytes, _now: Instant) -> BoxResult<()> {
+    async fn on_message(&mut self, raw: Bytes) -> BoxResult<()> {
         let message = parser::parse_message(&raw);
-        tracing::trace!("[{}] Processing message {message:?}", self.peer_addr);
+        tracing::debug!("[{}] Processing message {message:?}", self.peer_addr);
 
         match message {
             Err(err) => {
                 tracing::debug!("invalid message received {err:?}");
-                self.force_close().await
+                self.initiate_close().await
             }
-            Ok(_) if !self.state.can_send() => self.force_close().await,
             Ok(Message::Connect { session }) => {
-                self.session = Some(session);
+                self.state = ConnectionState::Open { session };
                 self.send_ack_data().await?;
                 Ok(())
             }
+            // TODO! not sure about this can_send business, it's probably better
+            // to manually require a session when it makes sense.
+            // Ok(_) if !self.state.can_send() => self.force_close().await,
             Ok(Message::Ack { session, len }) => {
-                self.set_and_check_session(session).await?;
+                self.check_session(session).await?;
                 let offset = self.sent_offset as usize;
                 match (len as usize).cmp(&(self.send_buffer.len() + offset)) {
                     std::cmp::Ordering::Less => {
@@ -286,7 +357,7 @@ impl Connection {
                                     "Connection sent more the max number of bytes ({}), closing it down",
                                     u32::MAX
                                 );
-                                self.force_close().await
+                                self.initiate_close().await
                             }
                         }
                     }
@@ -298,107 +369,20 @@ impl Connection {
                     }
                     std::cmp::Ordering::Greater => {
                         // peer is misbehaving, acknoledging stuff we never sent
-                        self.force_close().await
+                        self.initiate_close().await
                     }
                 }
             }
             Ok(Message::Data { session, pos, data }) => {
-                self.set_and_check_session(session).await?;
+                self.check_session(session).await?;
                 self.receive_data(pos, data).await?;
                 Ok(())
             }
             Ok(Message::Close { session }) => {
-                self.set_and_check_session(session).await?;
-                self.force_close().await
-            }
-        }
-    }
-
-    async fn on_socket_message(&mut self, msg: SocketMessage) -> BoxResult<()> {
-        match msg {
-            SocketMessage::SendData { data } => {
-                self.send_buffer.extend_from_slice(&data);
-                self.send_data().await
-            }
-            SocketMessage::Recv { result_chan, limit } => {
-                let slice_len = std::cmp::min(limit, self.recv_buffer.len());
-                let result = self.recv_buffer.split_to(slice_len).freeze();
-                self.recv_offset += slice_len as u32;
-                match result_chan.send(result) {
-                    Ok(_) => Ok(()),
-                    Err(_) => {
-                        tracing::debug!("an lrcp socket requested some data but went away before we could send it back");
-                        Ok(())
-                    }
-                }
-            }
-            SocketMessage::Close => self.force_close().await,
-        }
-    }
-
-    async fn force_close(&mut self) -> BoxResult<()> {
-        self.state = ConnectionState::Closed;
-        let session = self.get_session()?;
-
-        self.sock
-            .send_to(&Message::Close { session }.to_bytes(), self.peer_addr)
-            .await?;
-
-        Ok(())
-    }
-
-    async fn set_and_check_session(&mut self, session: u32) -> BoxResult<()> {
-        match self.session {
-            Some(s) => {
-                if s != session {
-                    self.force_close().await?;
-                    Err(format!("Invalid session for {}", self.peer_addr).into())
-                } else {
-                    Ok(())
-                }
-            }
-            None => {
-                self.session = Some(session);
-                Ok(())
-            }
-        }
-    }
-
-    async fn receive_data(&mut self, pos: u32, data: Bytes) -> BoxResult<()> {
-        // usize -> u32 is OK because a LRCP messages are under 1000 bytes
-        // (and the parser checks for that)
-        assert!(data.len() < u32::MAX as usize);
-        let data_len = data.len() as u32;
-        match self.recv_offset.cmp(&pos) {
-            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
-                if pos + data_len > self.recv_offset {
-                    let start = self.recv_offset - pos;
-                    let new_data = &data[start as usize..data.len()];
-                    self.recv_buffer.extend_from_slice(new_data);
-                    // match self.recv_offset.checked_add(new_data.len() as u32) {
-                    //     Some(offset) => self.recv_offset = offset,
-                    //     None => {
-                    //         tracing::error!(
-                    //             "Received more than the maximum limit of bytes: {}, closing the connection",
-                    //             u32::MAX
-                    //         );
-                    //         return self.force_close().await;
-                    //     }
-                    // };
-                }
-                // else: we got stale data, simply resend an ack for the latest data
-                self.send_ack_data().await?;
-                Ok(())
-            }
-            std::cmp::Ordering::Greater => {
-                // there are some missed data inbetween, so simply ignore completely this
-                // chunk of data
-                tracing::trace!(
-                    "[{:?}] received data too far ahead, got {} but current offset is at {}. Ignoring packet.",
-                    self.session,
-                    pos,
-                    self.recv_offset
-                );
+                self.check_session(session).await?;
+                let msg = Message::Close { session };
+                self.sock.send_to(&msg.to_bytes(), self.peer_addr).await?;
+                self.state = ConnectionState::Closed;
                 Ok(())
             }
         }
@@ -409,18 +393,54 @@ impl Connection {
             session: self.get_session()?,
             len: self.recv_offset + self.recv_buffer.len() as u32,
         };
+        tracing::trace!("[{}] sending {ack:?}", self.peer_addr);
         self.sock.send_to(&ack.to_bytes(), self.peer_addr).await?;
         Ok(())
     }
 
     /// for when a session is required
     fn get_session(&self) -> BoxResult<u32> {
-        self.session
-            .ok_or("Session is required but set to None".into())
+        match &self.state {
+            ConnectionState::Open { session } => Ok(*session),
+            s => Err(format!("Session is required but connection is in state {s:?}").into()),
+        }
+    }
+
+    /// when this connection wants to close the lrcp stream for whatever reason.
+    async fn initiate_close(&mut self) -> BoxResult<()> {
+        if let Ok(session) = self.get_session() {
+            self.sock
+                .send_to(&Message::Close { session }.to_bytes(), self.peer_addr)
+                .await?;
+            self.state = ConnectionState::Closing { session };
+        } else {
+            self.state = ConnectionState::Closed;
+        };
+
+        Ok(())
+    }
+
+    async fn check_session(&mut self, session: u32) -> BoxResult<()> {
+        match &self.state {
+            ConnectionState::Open { session: s } | ConnectionState::Closing { session: s } => {
+                if *s != session {
+                    self.initiate_close().await?;
+                    Err(format!("Invalid session for {}", self.peer_addr).into())
+                } else {
+                    Ok(())
+                }
+            }
+            st => Err(format!("Requires a session but currently in state {st:?}").into()),
+        }
     }
 
     /// send as much data as we can from the internal buffer
     async fn send_data(&mut self) -> BoxResult<()> {
+        tracing::trace!(
+            "[{}] sending {} bytes of data",
+            self.peer_addr,
+            self.send_buffer.len()
+        );
         if self.send_buffer.is_empty() {
             return Ok(());
         }
@@ -441,6 +461,106 @@ impl Connection {
         // retransmit
         Ok(())
     }
+
+    async fn receive_data(&mut self, pos: u32, data: Bytes) -> BoxResult<()> {
+        // usize -> u32 is OK because a LRCP messages are under 1000 bytes
+        // (and the parser checks for that)
+        assert!(data.len() < u32::MAX as usize);
+        let data_len = data.len() as u32;
+        match self.recv_offset.cmp(&pos) {
+            std::cmp::Ordering::Less | std::cmp::Ordering::Equal => {
+                if pos + data_len > self.recv_offset {
+                    let start = self.recv_offset - pos;
+                    let new_data = &data[start as usize..data.len()];
+                    self.recv_buffer.extend_from_slice(new_data);
+                }
+                // else: we got stale data, simply resend an ack for the latest data
+                self.send_ack_data().await?;
+                // and also notify the attached stream of any potential available read
+                self.yield_bytes().await?;
+                Ok(())
+            }
+            std::cmp::Ordering::Greater => {
+                // there are some missed data inbetween, so simply completely
+                // ignore this chunk of data
+                tracing::trace!(
+                    "[{:?}] received data too far ahead, got {} but current offset is at {}. Ignoring packet.",
+                    self.state,
+                    pos,
+                    self.recv_offset
+                );
+                Ok(())
+            }
+        }
+    }
+
+    async fn on_socket_message(&mut self, msg: SocketMessage) -> BoxResult<()> {
+        tracing::debug!("[{}] processing socket message: {msg:?}", self.peer_addr);
+        match msg {
+            SocketMessage::SendData { data } => {
+                self.send_buffer.extend_from_slice(&data);
+                self.send_data().await
+            }
+            SocketMessage::Recv { result_chan, limit } => {
+                self.recv_chan = Some((result_chan, limit));
+                self.yield_bytes().await
+            }
+            SocketMessage::Shutdown => self.initiate_close().await,
+        }
+    }
+
+    /// process a read request to a high level stream
+    async fn yield_bytes(&mut self) -> BoxResult<()> {
+        if self.recv_buffer.is_empty() {
+            return Ok(());
+        }
+
+        let (chan, limit) = match self.recv_chan.take() {
+            Some(x) => x,
+            None => return Ok(()),
+        };
+
+        let slice_len = std::cmp::min(limit, self.recv_buffer.len());
+        let result = self.recv_buffer.split_to(slice_len).freeze();
+        self.recv_offset += slice_len as u32;
+        match chan.send(result) {
+            Ok(_) => Ok(()),
+            Err(_) => {
+                tracing::debug!(
+                    "an lrcp socket requested some data but went away before we could send it back"
+                );
+                Ok(())
+            }
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+enum ConnectionState {
+    Opening,
+    Open { session: u32 },
+    Closing { session: u32 },
+    Closed,
+}
+
+impl ConnectionState {
+    fn is_open(&self) -> bool {
+        match self {
+            ConnectionState::Open { .. } => true,
+            _ => false,
+        }
+    }
+}
+
+async fn get_socket() -> (SocketAddr, Arc<UdpSocket>) {
+    // 0 asks the OS to assign a port
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("can bind on localhost");
+    let addr = socket
+        .local_addr()
+        .expect("bound socket has a local address");
+    (addr, Arc::new(socket))
 }
 
 #[derive(Debug, PartialEq)]
@@ -489,21 +609,12 @@ impl Message {
     }
 }
 
-struct LrcpSocket {
-    tx: Sender<SocketMessage>,
-}
-
-struct LrcpSocketRead {
+struct LrcpStreamRead {
     tx: Sender<SocketMessage>,
     fut: Option<BoxFuture<'static, std::io::Result<Bytes>>>,
-    // fut: Pin<Option<Box<dyn Future<Output = std::io::Result<Bytes>>>>>,
 }
 
-struct LrcpSocketWrite {
-    tx: Sender<SocketMessage>,
-}
-
-impl AsyncRead for LrcpSocketRead {
+impl AsyncRead for LrcpStreamRead {
     fn poll_read(
         mut self: Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -543,7 +654,6 @@ impl AsyncRead for LrcpSocketRead {
 
 /// messages used to communicate between the high level LrcpSocket and
 /// the low level Connection
-#[derive(Debug)]
 enum SocketMessage {
     SendData {
         data: Bytes,
@@ -553,22 +663,27 @@ enum SocketMessage {
         result_chan: oneshot::Sender<Bytes>,
         limit: usize,
     },
-    Close,
+    Shutdown,
 }
 
-impl LrcpSocket {
-    fn split(self) -> (LrcpSocketRead, LrcpSocketWrite) {
-        (
-            LrcpSocketRead {
-                tx: self.tx.clone(),
-                fut: None,
-            },
-            LrcpSocketWrite { tx: self.tx },
-        )
+impl std::fmt::Debug for SocketMessage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SendData { data } => f.debug_struct("SendData").field("data", data).finish(),
+            Self::Recv {
+                result_chan: _,
+                limit,
+            } => f
+                .debug_struct("Recv")
+                // .field("result_chan", result_chan)
+                .field("limit", limit)
+                .finish(),
+            Self::Shutdown => write!(f, "Shutdown"),
+        }
     }
 }
 
-impl LrcpSocketRead {
+impl LrcpStreamRead {
     /// Read some bytes from the underlying Connection
     /// blocks until there is some data to read
     /// if the returned Bytes object is empty, that means the connection
@@ -585,7 +700,11 @@ impl LrcpSocketRead {
     }
 }
 
-impl LrcpSocketWrite {
+struct LrcpStreamWrite {
+    tx: Sender<SocketMessage>,
+}
+
+impl LrcpStreamWrite {
     async fn send(&self, data: Bytes) -> BoxResult<()> {
         self.tx.send(SocketMessage::SendData { data }).await?;
         Ok(())
@@ -593,18 +712,18 @@ impl LrcpSocketWrite {
 
     /// close the underlying Connection
     async fn shutdown(&self) -> BoxResult<()> {
-        self.tx.send(SocketMessage::Close).await?;
+        self.tx.send(SocketMessage::Shutdown).await?;
         Ok(())
     }
 }
 
 struct Reversal {
-    sock: LrcpSocket,
+    stream: LrcpStream,
 }
 
 impl Reversal {
-    fn new(sock: LrcpSocket) -> Self {
-        Self { sock }
+    fn new(stream: LrcpStream) -> Self {
+        Self { stream }
     }
 
     fn spawn_run(self) -> JoinHandle<()> {
@@ -617,14 +736,16 @@ impl Reversal {
     }
 
     async fn run(self) -> BoxResult<()> {
-        let (rdr, wrt) = self.sock.split();
+        let (rdr, wrt) = self.stream.split();
         let rdr = BufReader::new(rdr);
         let mut lines = rdr.split(b'\n');
         while let Some(line) = lines.next_segment().await? {
-            let mut data = BytesMut::with_capacity(line.len());
+            tracing::trace!("reversal got a line! {line:?}");
+            let mut data = BytesMut::with_capacity(line.len() + 1);
             for chr in line.into_iter().rev() {
                 data.put_u8(chr);
             }
+            data.put_u8(b'\n');
             wrt.send(data.freeze()).await?;
         }
         Ok(())
@@ -633,27 +754,8 @@ impl Reversal {
 
 #[cfg(test)]
 mod test {
-    use std::time::Duration;
-
     use super::*;
     use pretty_assertions::assert_eq;
-    use std::net::ToSocketAddrs;
-    use tokio::time::timeout;
-
-    async fn get_socket() -> (SocketAddr, Arc<UdpSocket>) {
-        for port in 8000..9000 {
-            let addr = format!("127.0.0.1:{port}")
-                .to_socket_addrs()
-                .unwrap()
-                .next()
-                .unwrap();
-            match UdpSocket::bind(addr).await {
-                Ok(l) => return (addr, Arc::new(l)),
-                Err(_) => continue,
-            }
-        }
-        panic!("Couldn't find an available port !");
-    }
 
     /// make sure to abort a task on drop, so that it's easier to
     /// do assertion in tests with less worry about cleaning up
@@ -681,94 +783,28 @@ mod test {
     }
 
     #[tokio::test]
-    #[ignore]
-    async fn test_example_session() {
-        let _ = tracing_subscriber::fmt::try_init();
-        let (addr, sock) = get_socket().await;
-        let (conn, tx, _) = Connection::new(Arc::clone(&sock), addr);
-        let _hdl = AbortHdl(conn.spawn_run());
-
-        let session = 123;
-        let msg = Message::Connect { session };
-        tx.send(ServerMessage::SocketData {
-            data: Bytes::copy_from_slice(msg.to_bytes().as_slice()),
-            now: Instant::now(),
-        })
-        .await
-        .unwrap();
-
-        let mut buf = [0; 1024];
-        let n = timeout(Duration::from_millis(100), sock.recv(&mut buf))
-            .await
-            .expect("no timeout")
-            .expect("can receive data");
-        let response = parser::parse_message(&buf[0..n]).expect("valid response");
-        assert_eq!(Message::Ack { session, len: 0 }, response);
-
-        let data = b"Hello, world!";
-        let msg = Message::Data {
-            session,
-            pos: 0,
-            data: Bytes::copy_from_slice(data),
-        };
-        tx.send(ServerMessage::SocketData {
-            data: msg.to_bytes().into(),
-            now: Instant::now(),
-        })
-        .await
-        .expect("can send data");
-
-        let n = timeout(Duration::from_millis(100), sock.recv(&mut buf))
-            .await
-            .expect("no timeout")
-            .expect("can receive data");
-        let response = parser::parse_message(&buf[0..n]).expect("valid response");
-        assert_eq!(
-            Message::Ack {
-                session,
-                len: data.len() as u32
-            },
-            response
-        );
-
-        let msg = Message::Close { session };
-        tx.send(ServerMessage::SocketData {
-            data: msg.to_bytes().into(),
-            now: Instant::now(),
-        })
-        .await
-        .expect("can send message");
-
-        let n = timeout(Duration::from_millis(100), sock.recv(&mut buf))
-            .await
-            .expect("no timeout")
-            .expect("can receive data");
-        let response = parser::parse_message(&buf[0..n]).expect("valid response");
-        assert_eq!(Message::Close { session }, response);
-
-        assert!(tx.is_closed(), "channel should be closed now");
-    }
-
-    #[tokio::test]
     async fn test_reversal() {
         let _ = tracing_subscriber::fmt::try_init();
-        let (addr, sock) = get_socket().await;
-        let (conn, tx, lrcp_sock) = Connection::new(Arc::clone(&sock), addr);
-        let _hdl_conn = AbortHdl(conn.spawn_run());
-        let _hdl_sock = AbortHdl(Reversal::new(lrcp_sock).spawn_run());
-        let _hdl_server = AbortHdl(tokio::spawn(async move {
-            Server{sock}.run().await.expect("run server");
+        let server = Server::bind("127.0.0.1:0").await.expect("bind server");
+        let server_addr = server
+            .sock
+            .local_addr()
+            .expect("server has a local address");
+        tracing::info!("server has address {server_addr}");
+        let _hdl = AbortHdl(tokio::spawn(async move {
+            server.run().await.expect("server ran properly");
         }));
-
-        tracing::info!("receiving socket bound to {addr}");
-        let (_, test_sock) = get_socket().await;
-        let session = 12345;
-        let (test_conn, _, test_lrcp) =
-            Connection::connect(Arc::into_inner(test_sock).unwrap(), addr, session)
-                .await
-                .expect("can connect");
-
-        todo!("finish test");
+        let client = LrcpStream::connect(server_addr, 1234)
+            .await
+            .expect("client connected");
+        let (client_rdr, client_wrt) = client.split();
+        client_wrt
+            .send(Bytes::from_static(b"hello\n"))
+            .await
+            .expect("send data");
+        let resp = client_rdr.recv().await.expect("receive response");
+        client_wrt.shutdown().await.expect("shutdown");
+        assert_eq!(&resp, b"olleh\n".as_slice(), "message is reversed");
     }
 }
 

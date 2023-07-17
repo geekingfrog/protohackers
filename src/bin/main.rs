@@ -20,6 +20,7 @@ enum Command {
     MITM,
     Speed,
     Reversal,
+    ReversalClient,
 }
 
 #[tokio::main]
@@ -37,6 +38,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::MITM => protohacker::mitm::main(addr).await?,
         Command::Speed => protohacker::speed::main(addr).await?,
         Command::Reversal => protohacker::reversal::main(addr).await?,
+        Command::ReversalClient => protohacker::reversal::test_main(addr).await?,
     }
 
     Ok(())

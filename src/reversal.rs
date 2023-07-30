@@ -5,6 +5,7 @@
 use std::{
     cmp,
     collections::BTreeMap,
+    fmt::Write as _,
     io::{Error as IoError, ErrorKind},
     net::SocketAddr,
     pin::Pin,
@@ -173,6 +174,7 @@ impl LrcpStream {
 struct Server {
     sock: Arc<UdpSocket>,
     clock: Arc<Clock>,
+    local_addr: SocketAddr,
 }
 
 impl Server {
@@ -181,14 +183,17 @@ impl Server {
         A: tokio::net::ToSocketAddrs,
     {
         let sock = UdpSocket::bind(bind_addr).await?;
-        tracing::info!("udp listening on {}", sock.local_addr().unwrap());
+        let local_addr = sock.local_addr()?;
+        tracing::info!("udp listening on {}", local_addr);
         Ok(Server {
             sock: Arc::new(sock),
             clock,
+            local_addr,
         })
     }
 
     async fn run(&self) -> BoxResult<()> {
+        tracing::info!("[{}] starting server", self.local_addr);
         let mut clients = BTreeMap::new();
         Arc::clone(&self.clock).tick_every(Duration::from_millis(100));
         loop {
@@ -202,10 +207,14 @@ impl Server {
             }
 
             let tx_conn = clients.entry(peer_addr).or_insert_with(|| {
-                tracing::info!("starting a new connection for {peer_addr}");
+                tracing::info!(
+                    "[{}] starting a new connection for {peer_addr}",
+                    self.local_addr
+                );
                 let (tx, rx) = mpsc::channel(10);
                 let clock = Arc::clone(&self.clock);
                 let conn = Connection {
+                    local_addr: self.local_addr,
                     sock: Arc::clone(&self.sock),
                     clock,
                     peer_addr,
@@ -230,6 +239,7 @@ impl Server {
 }
 
 struct Connection {
+    local_addr: SocketAddr,
     sock: Arc<UdpSocket>,
     clock: Arc<Clock>,
     peer_addr: SocketAddr,
@@ -259,6 +269,7 @@ impl Connection {
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
             .unwrap_or(true);
         if !already_running {
+            tracing::trace!("[{}] running connection in the backround", self.local_addr);
             tokio::task::spawn(async move { self.run().await });
         } else {
             tracing::warn!("Attempting to spawn_run a connection twice");
@@ -267,9 +278,10 @@ impl Connection {
 
     /// create a client connection connected to the given peer_addr (doesn't spawn any task)
     async fn construct(clock: Arc<Clock>, peer_addr: SocketAddr) -> BoxResult<Connection> {
-        let (_local_addr, sock) = get_socket().await;
+        let (local_addr, sock) = get_socket().await;
         sock.connect(peer_addr).await?;
         let conn = Connection {
+            local_addr,
             sock: Arc::clone(&sock),
             clock,
             peer_addr,
@@ -300,6 +312,7 @@ impl Connection {
         let lrcp_session = LrcpSession::new(
             Arc::clone(&self.clock),
             Arc::clone(&self.sock),
+            self.local_addr,
             self.peer_addr,
             session,
             message_rx,
@@ -309,11 +322,21 @@ impl Connection {
         self.sessions.lock().unwrap().insert(session, message_tx);
         let stream = LrcpStream { tx: sess_tx };
         stream.connect(session).await?;
+        tracing::info!(
+            "[{}] stream connected to {} on session {}",
+            self.local_addr,
+            self.peer_addr,
+            session
+        );
         Ok(stream)
     }
 
     async fn run(&self) -> BoxResult<()> {
-        tracing::info!("[{}] starting connection", self.peer_addr);
+        tracing::info!(
+            "[{}] starting connection with {}",
+            self.local_addr,
+            self.peer_addr
+        );
 
         let mut buf = [0; MAX_MESSAGE_LEN + 1];
 
@@ -364,6 +387,7 @@ impl Connection {
                     let lrcp_session = LrcpSession::new(
                         Arc::clone(&self.clock),
                         Arc::clone(&self.sock),
+                        self.local_addr,
                         self.peer_addr,
                         session,
                         message_rx,
@@ -387,7 +411,11 @@ impl Connection {
             }
         }
 
-        tracing::debug!("[{}] Terminating connection", self.peer_addr);
+        tracing::debug!(
+            "[{}] terminating connection with {}",
+            self.local_addr,
+            self.peer_addr
+        );
         Ok(())
     }
 }
@@ -395,6 +423,7 @@ impl Connection {
 /// low level stream, bound to a session
 /// handling timeouts, retransmission and connection state
 struct LrcpSession {
+    local_addr: SocketAddr,
     sock: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     session: u32,
@@ -408,9 +437,9 @@ struct LrcpSession {
     /// The data received alongside an offset. Once the application
     /// has read some of it, it can be discarded, but the length of data
     /// should be preserved to keep the ACK position
-    recv_buffer: BytesMut,
-    recv_offset: u32,
-
+    recv_buffer: PacketBuffer,
+    // recv_buffer: BytesMut,
+    // recv_offset: u32,
     /// when a high level stream request to read but there's nothing in the
     /// recv_buffer and the connection isn't closing/closed, that means we need
     /// to park the request for read until we get some data, and *then* we respond.
@@ -430,7 +459,7 @@ struct LrcpSession {
 
     /// set when sending data, if we haven't seen an ACK for at least this length
     /// we need to resend the data
-    send_data_rto: Option<(Instant, u32)>,
+    send_data_rto: Option<(Instant, Vec<u32>)>,
 
     /// if we haven't seen anything from the peer after this Instant, assume
     /// it went awol and terminate the connection
@@ -444,6 +473,7 @@ impl LrcpSession {
     fn new(
         clock: Arc<Clock>,
         sock: Arc<UdpSocket>,
+        local_addr: SocketAddr,
         peer_addr: SocketAddr,
         session: u32,
         message_rx: Receiver<Message>,
@@ -452,6 +482,7 @@ impl LrcpSession {
         let timer_chan = clock.register_connection();
         LrcpSession {
             sock,
+            local_addr,
             peer_addr,
             session,
             message_rx,
@@ -459,8 +490,7 @@ impl LrcpSession {
                 retry_left: 3,
                 notify_connected: None,
             },
-            recv_buffer: BytesMut::new(),
-            recv_offset: 0,
+            recv_buffer: PacketBuffer::new(),
             recv_chan: None,
             send_buffer: BytesMut::new(),
             sent_offset: 0,
@@ -484,7 +514,7 @@ impl LrcpSession {
     }
 
     async fn run(mut self) -> BoxResult<()> {
-        tracing::info!("[{}] starting session {}", self.peer_addr, self.session);
+        tracing::info!("[{}] starting session {}", self.local_addr, self.session);
 
         let mut lrcp_sock_closed = false;
         let mut has_timer = true;
@@ -522,7 +552,7 @@ impl LrcpSession {
                         Some(now) => self.on_tick(now).await?,
                         None => {
                             has_timer = false;
-                            tracing::info!("Connection is running without a timer");
+                            tracing::warn!("Connection is running without a timer");
                         }
                     }
                 }
@@ -534,14 +564,19 @@ impl LrcpSession {
     }
 
     async fn on_message(&mut self, message: Message) -> BoxResult<()> {
-        tracing::trace!("[{}] Processing message {message:?}", self.peer_addr);
+        tracing::trace!(
+            "[{}] processing message {message:?} for session {} in state {:?}",
+            self.local_addr,
+            self.session,
+            self.state,
+        );
         self.session_timeout = Some(self.clock.now() + SESSION_TIMEOUT);
 
         match message {
             Message::Connect { session } => {
                 tracing::info!(
-                    "[{}] New incoming connection with session {session}",
-                    self.peer_addr
+                    "[{}] new incoming connection with session {session}",
+                    self.local_addr
                 );
                 self.state = StreamState::Open;
                 self.send_ack_data().await?;
@@ -560,13 +595,20 @@ impl LrcpSession {
                             };
                         if let Some(chan) = notify_connected.take() {
                             chan.send(()).map_err(|_| {
-                                tracing::warn!("stream was dropped while waiting for connection");
+                                tracing::warn!(
+                                    "[{}] stream was dropped while waiting for connection",
+                                    self.local_addr
+                                );
                                 let r: BoxError =
                                     "stream was dropped while waiting for connection".into();
                                 r
                             })?;
                         }
-                        tracing::debug!("[{}] session opened: {session}", self.peer_addr);
+                        tracing::debug!(
+                            "[{}] session opened: {session} with peer {}",
+                            self.local_addr,
+                            self.peer_addr
+                        );
                         return Ok(());
                     } else {
                         self.state = StreamState::Closed;
@@ -577,11 +619,22 @@ impl LrcpSession {
                     }
                 };
 
-                // clear any expectation of a pending ack if the one we just got
-                // is for all the data we already sent
-                if let Some((_, ack_n)) = &self.send_data_rto {
-                    if &len >= ack_n {
+                // if the acks arrive out of order
+                if let Some((i, expected_acks)) = self.send_data_rto.take() {
+                    let expected_acks: Vec<_> = expected_acks
+                        .into_iter()
+                        .filter(|ack_len| ack_len > &len)
+                        .collect();
+                    if expected_acks.is_empty() {
+                        tracing::trace!("[{}] no more pending acks", self.local_addr);
                         self.send_data_rto = None;
+                    } else {
+                        tracing::trace!(
+                            "[{}] after processing ack, still expecting the following acks: {:?}",
+                            self.local_addr,
+                            expected_acks
+                        );
+                        self.send_data_rto = Some((i, expected_acks))
                     }
                 }
 
@@ -594,14 +647,12 @@ impl LrcpSession {
                     // peer is misbehaving, acknoledging stuff we never sent
                     self.initiate_close().await
                 } else {
+                    // peer got at least `len` data, so we can discard our internal
+                    // send buffer accordingly
                     let start = len - self.sent_offset;
                     let _ = self.send_buffer.split_to(start as usize);
                     self.sent_offset = len;
-                    if !self.send_buffer.is_empty() {
-                        self.send_data().await
-                    } else {
-                        Ok(())
-                    }
+                    Ok(())
                 }
             }
             Message::Data {
@@ -624,14 +675,18 @@ impl LrcpSession {
     async fn on_tick(&mut self, now: Instant) -> BoxResult<()> {
         if let Some(session_timeout) = &self.session_timeout {
             if &now > session_timeout {
-                tracing::info!("[{}] isn't responding, terminating", self.peer_addr);
+                tracing::info!(
+                    "[{}] peer at {} isn't responding, terminating",
+                    self.local_addr,
+                    self.peer_addr
+                );
                 // no point sending a Close message to a peer who went away
                 self.state = StreamState::Closed;
                 return Ok(());
             }
         };
 
-        if let Some((ack_timeout, ack_len)) = &self.send_data_rto {
+        if let Some((ack_timeout, _expected_acks)) = &self.send_data_rto {
             if &now > ack_timeout {
                 match &mut self.state {
                     StreamState::Opening {
@@ -649,11 +704,12 @@ impl LrcpSession {
                     }
                     StreamState::Closed => (),
                     _ => {
-                        tracing::trace!(
-                            "[{}] ack timeout for len {ack_len}, resending data for session {}",
-                            self.peer_addr,
-                            self.session
-                        );
+                        // tracing::trace!(
+                        //     "[{}] {} acks timeout, resending all data for session {}",
+                        //     self.local_addr,
+                        //     expected_acks.len(),
+                        //     self.session
+                        // );
                         self.send_data().await?
                     }
                 };
@@ -665,11 +721,11 @@ impl LrcpSession {
     async fn send_ack_data(&mut self) -> BoxResult<()> {
         let ack = Message::Ack {
             session: self.session,
-            len: self.recv_offset + self.recv_buffer.len() as u32,
+            len: self.recv_buffer.highest_ack(),
         };
         tracing::trace!(
             "[{}] sending {ack:?} for session {}",
-            self.peer_addr,
+            self.local_addr,
             self.session
         );
         self.sock.send_to(&ack.to_bytes(), self.peer_addr).await?;
@@ -707,29 +763,43 @@ impl LrcpSession {
         }
 
         // 10 is the maximum length that a u32 in string format can take
-        // if we happen not to send everything in the buffer it's okay
-        // because this packet will generate an ACK at some point, and when
-        // we receive this ACK, we'll attempt to send the remaining.
         let max_data_len = MAX_MESSAGE_LEN - 2 * 10 - "/data///".len();
-        let len = cmp::min(max_data_len, self.send_buffer.len());
+        let mut start = 0;
+        let max_len = cmp::min(max_data_len, self.send_buffer.len());
+        let mut expected_acks = Vec::new();
 
-        tracing::trace!(
-            "[{}] sending {} bytes of data for session {}, offset: {}, len: {}",
-            self.peer_addr,
-            len,
-            self.session,
-            self.sent_offset,
-            self.send_buffer.len(),
-        );
+        loop {
+            let slice_len = cmp::min(self.send_buffer.len() - start, max_len);
+            if slice_len == 0 {
+                break;
+            }
+            let slice = &self.send_buffer[start..start + slice_len];
+            let pos = self.sent_offset + start as u32;
+            tracing::trace!(
+                "[{}] sending {} bytes of data for session {}, pos: {}, len: {} - {:?}",
+                self.local_addr,
+                slice.len(),
+                self.session,
+                pos,
+                self.send_buffer.len(),
+                std::str::from_utf8(slice),
+            );
 
-        let msg = Message::Data {
-            session: self.session,
-            pos: self.sent_offset,
-            data: Bytes::copy_from_slice(&self.send_buffer[0..len]),
-        };
-        self.sock.send_to(&msg.to_bytes(), self.peer_addr).await?;
-        let expected_ack = self.sent_offset + len as u32;
-        self.send_data_rto = Some((self.clock.now() + Duration::from_secs(3), expected_ack));
+            let msg = Message::Data {
+                session: self.session,
+                pos,
+                data: Bytes::copy_from_slice(slice),
+            };
+            self.sock.send_to(&msg.to_bytes(), self.peer_addr).await?;
+            expected_acks.push(pos + slice_len as u32);
+            start += slice.len();
+        }
+
+        if !expected_acks.is_empty() {
+            let rto = self.clock.now() + Duration::from_secs(3);
+            self.send_data_rto = Some((rto, expected_acks));
+        }
+
         Ok(())
     }
 
@@ -738,47 +808,40 @@ impl LrcpSession {
         // (and the parser checks for that)
         assert!(data.len() < u32::MAX as usize);
         let data_len = data.len() as u32;
-        // this is also ok because `len` is a u32, which limits the size of data we can send
-        // that's a bit more dubious, but :shrug:
-        let buf_len = self.recv_buffer.len() as u32;
 
-        if pos + data_len <= self.recv_offset + buf_len {
+        if pos + data_len <= self.recv_buffer.highest_ack() {
             tracing::trace!(
-                "[{}] got data up to {} but already have {} + {} so resending ack for session {}",
-                self.peer_addr,
+                "[{}] got data up to {} but already have {} so resending ack for session {}",
+                self.local_addr,
                 pos + data.len() as u32,
-                self.recv_offset,
-                data_len,
+                self.recv_buffer.highest_ack(),
                 self.session,
             );
             self.send_ack_data().await
-        } else if pos > self.recv_offset + buf_len {
-            tracing::trace!("got data starting from {} but only have data until {}, missed something and ignoring",
-                pos,
-                self.recv_offset + data_len
-            );
-            Ok(())
         } else {
-            // don't grab data we already have
-            let start = self.recv_offset + buf_len - pos;
-            let new_data = &data[start as usize..];
-            self.recv_buffer.extend_from_slice(new_data);
-            tracing::trace!(
-                "[{}] added {} bytes to recv buffer for session {}, total read: {}",
-                self.peer_addr,
-                new_data.len(),
-                self.session,
-                self.recv_offset as usize + self.recv_buffer.len()
-            );
-            self.send_ack_data().await?;
+            if let Err(_) = self.recv_buffer.write(pos, data) {
+                tracing::warn!(
+                    "[{}] buffer for session {} is full",
+                    self.local_addr,
+                    self.session
+                );
+                Ok(())
+            } else {
+                tracing::trace!(
+                    "[{}] wrote {data_len} bytes in the internal buffer, highest ack is now: {}",
+                    self.local_addr,
+                    self.recv_buffer.highest_ack()
+                );
+                self.send_ack_data().await?;
 
-            // need to notify any potential reader that new data is available
-            self.yield_bytes()
+                // need to notify any potential reader that new data is available
+                self.yield_bytes()
+            }
         }
     }
 
     async fn on_socket_message(&mut self, msg: SocketMessage) -> BoxResult<()> {
-        tracing::trace!("[{}] processing socket message: {msg:?}", self.peer_addr);
+        tracing::trace!("[{}] processing socket message: {msg:?}", self.local_addr);
         match msg {
             SocketMessage::Connect { session, connected } => {
                 // TODO: maybe prevent calling Connect on a stream that isn't in
@@ -805,31 +868,40 @@ impl LrcpSession {
 
     /// process a read request to a high level stream
     fn yield_bytes(&mut self) -> BoxResult<()> {
-        if self.recv_buffer.is_empty() {
-            return Ok(());
-        }
-
         let (chan, limit) = match self.recv_chan.take() {
             Some(x) => x,
             None => return Ok(()),
         };
 
-        let slice_len = cmp::min(limit, self.recv_buffer.len());
-        let result = self.recv_buffer.split_to(slice_len).freeze();
-        self.recv_offset += slice_len as u32;
-        match chan.send(result) {
+        tracing::trace!(
+            "[{}] attempting to yield bytes from buffer: {}",
+            self.local_addr,
+            self.recv_buffer.compact_debug()?
+        );
+        let (pos, bs) = match self.recv_buffer.read(limit) {
+            None => {
+                self.recv_chan = Some((chan, limit));
+                return Ok(());
+            }
+            Some(x) => x,
+        };
+
+        let slice_len = bs.len();
+        match chan.send(bs) {
             Ok(_) => {
                 tracing::trace!(
-                    "[{}] notified stream of a read of {} bytes for session {}",
-                    self.peer_addr,
+                    "[{}] notified stream of a read of {} bytes starting at {} for session {}",
+                    self.local_addr,
                     slice_len,
+                    pos,
                     self.session,
                 );
                 Ok(())
             }
             Err(_) => {
                 tracing::debug!(
-                    "an lrcp socket requested some data but went away before we could send it back"
+                    "[{}] an lrcp socket requested some data but went away before we could send it back",
+                    self.local_addr
                 );
                 Ok(())
             }
@@ -837,7 +909,6 @@ impl LrcpSession {
     }
 }
 
-#[derive(Debug)]
 enum StreamState {
     Opening {
         retry_left: u8,
@@ -846,6 +917,29 @@ enum StreamState {
     Open,
     Closing,
     Closed,
+}
+
+impl std::fmt::Debug for StreamState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Opening {
+                retry_left,
+                notify_connected,
+            } => {
+                let nc = match notify_connected {
+                    None => None,
+                    Some(_) => Some("<sender>"),
+                };
+                f.debug_struct("Opening")
+                    .field("retry_left", retry_left)
+                    .field("notify_connected", &nc as &dyn std::fmt::Debug)
+                    .finish()
+            }
+            Self::Open => write!(f, "Open"),
+            Self::Closing => write!(f, "Closing"),
+            Self::Closed => write!(f, "Closed"),
+        }
+    }
 }
 
 impl StreamState {
@@ -1074,6 +1168,162 @@ impl Reversal {
     }
 }
 
+/// a way to store a fixed number of received packets
+/// for now, doesn't handle de-duplication of overlapping data
+#[derive(Debug)]
+struct PacketBuffer {
+    /// a place to store received packet, potentially out of order
+    buf: Vec<Option<(u32, Bytes)>>,
+    /// keep a special place for the next packet we're expecting, to avoid
+    /// a situation where `buf` is full of later packet, and we can't
+    /// store the next packet in the sequence, blocking all the other ones.
+    next_packet: Option<(u32, Bytes)>,
+
+    /// the starting position, not necessarily the lowest stored
+    /// position in the buffer, because these can be released to the
+    /// application layer and then discarded from this buffer.
+    starting_pos: u32,
+}
+
+impl PacketBuffer {
+    fn new() -> PacketBuffer {
+        PacketBuffer {
+            buf: vec![None; 10],
+            next_packet: None,
+            starting_pos: 0,
+        }
+    }
+
+    /// Store a chunk of data starting at `pos` in the stream.
+    /// If it cannot be stored, the Err contains the given arguments
+    /// Storing can fail if the buffer is full or if the data to be stored
+    /// is starting from an earliest position as self.lowest_pos
+    fn write(&mut self, pos: u32, mut bs: Bytes) -> Result<(), (u32, Bytes)> {
+        if pos <= self.starting_pos && pos + bs.len() as u32 >= self.starting_pos {
+            let bs = bs.split_off((self.starting_pos - pos) as usize);
+
+            // if we get another packet for the starting position, see if it
+            // contains more data than what we already have
+            if let Some((_p, b)) = &self.next_packet {
+                if b.len() < bs.len() {
+                    self.next_packet = Some((self.starting_pos, bs));
+                }
+                Ok(())
+            } else {
+                self.next_packet = Some((self.starting_pos, bs));
+                Ok(())
+            }
+        } else if pos > self.starting_pos {
+            match self.buf.iter_mut().find(|el| el.is_none()) {
+                None => Err((pos, bs)), // buffer full
+                Some(el) => {
+                    // el is guaranteed to be None here
+                    el.replace((pos, bs));
+                    Ok(())
+                }
+            }
+        } else {
+            Ok(())
+        }
+    }
+
+    /// the highest position in the stream stored in the buffer.
+    /// so that we have seen *every* bytes from 0 to highest_ack
+    fn highest_ack(&self) -> u32 {
+        let mut res = match &self.next_packet {
+            None => return self.starting_pos,
+            Some((p, b)) => p + b.len() as u32,
+        };
+
+        // TODO maybe we should sort the buffer to avoid 0(n²) here?
+        let mut has_advanced = true;
+        while has_advanced {
+            has_advanced = false;
+            for el in &self.buf {
+                if let Some((p, b)) = el {
+                    if *p == res {
+                        res += b.len() as u32;
+                        has_advanced = true;
+                    }
+                }
+            }
+        }
+        res
+    }
+
+    /// returns the earliest bytes stored in this buffer. That is, the lowest
+    /// pos and its associated bytes. Don't return more than `limit` bytes
+    fn read(&mut self, limit: usize) -> Option<(u32, Bytes)> {
+        if let Some((p, mut b)) = self.next_packet.take() {
+            let to_return = if b.len() > limit {
+                self.starting_pos = p + limit as u32;
+                let to_return = b.split_to(limit);
+                self.next_packet = Some((self.starting_pos, b));
+                to_return
+            } else {
+                self.starting_pos = p + b.len() as u32;
+                b
+            };
+
+            // adjust other elements stored in the buffer to discard bytes
+            // that we just read.
+            for el in self.buf.iter_mut() {
+                let (pos, bs) = match el {
+                    Some(x) => x,
+                    None => continue,
+                };
+
+                if *pos <= self.starting_pos {
+                    if let Some((next_pos, next_bytes)) = &self.next_packet {
+                        if next_pos + next_bytes.len() as u32 >= *pos + bs.len() as u32 {
+                            *el = None;
+                        } else {
+                            self.next_packet = Some((
+                                self.starting_pos,
+                                bs.split_off((self.starting_pos - *pos) as usize),
+                            ));
+                            if bs.is_empty() {
+                                *el = None;
+                            }
+                        }
+                    } else {
+                        self.next_packet = Some((
+                            self.starting_pos,
+                            bs.split_off((self.starting_pos - *pos) as usize),
+                        ));
+                        if bs.is_empty() {
+                            *el = None;
+                        }
+                    }
+                }
+            }
+            Some((p, to_return))
+        } else {
+            None
+        }
+    }
+
+    fn compact_debug(&self) -> BoxResult<String> {
+        let mut f = String::new();
+        write!(&mut f, "PacketBuffer{{")?;
+        write!(&mut f, "starting_pos: {}, ", self.starting_pos)?;
+        write!(&mut f, "next_packet: ")?;
+        match &self.next_packet {
+            None => write!(&mut f, "None, ")?,
+            Some((p, bs)) => write!(&mut f, "Some(({p}, [..{}])), ", bs.len())?,
+        }
+        write!(&mut f, "buf: [")?;
+        for el in &self.buf {
+            match el {
+                None => write!(&mut f, "_,")?,
+                Some((p, b)) => write!(&mut f, "({p}, [..{}]),", b.len())?,
+            }
+        }
+        write!(&mut f, "]}}")?;
+        Ok(f)
+    }
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -1234,7 +1484,6 @@ mod test {
             .expect("client connected");
         let (client_rdr, client_wrt) = client.split();
 
-        // send the line in two messages
         client_wrt
             .send(Bytes::from_static(b"hello, world!\ncoucou\n"))
             .await
@@ -1402,7 +1651,7 @@ mod test {
 
         timeout(Duration::from_millis(10), client_sock.recv(&mut buf))
             .await
-            .expect("read no timeout after first half of data")
+            .expect("read ack 1 no timeout after first half of data")
             .expect("read from socket");
 
         let mut buf = [0; 1024];
@@ -1413,7 +1662,7 @@ mod test {
 
         timeout(Duration::from_millis(10), client_sock.recv(&mut buf))
             .await
-            .expect("read no timeout after first half of data")
+            .expect("read ack 2 no timeout after first half of data")
             .expect("read from socket");
 
         let len1 = timeout(Duration::from_millis(10), client_sock.recv(&mut buf))
@@ -1421,18 +1670,21 @@ mod test {
             .expect("read no timeout after first read")
             .expect("read from socket");
 
-        assert_eq!(Ok("/data/1234/0/b"), std::str::from_utf8(&buf[..14]));
         client_sock
             .send(format!("/ack/1234/{len1}/").as_bytes())
             .await
             .expect("ok sending ack");
+
+        // the expected position for the second packet is the length received minus
+        // the other bits used for the wire format
+        let expected_len = len1 - "/data/1234/0//".len();
 
         let _len2 = timeout(Duration::from_millis(10), client_sock.recv(&mut buf))
             .await
             .expect("read no timeout after second read")
             .expect("read from socket");
         assert_eq!(
-            format!("/data/1234/{len1}/aaa"),
+            format!("/data/1234/{expected_len}/aaa"),
             std::str::from_utf8(&buf[..18]).unwrap()
         );
     }
@@ -1449,6 +1701,46 @@ mod test {
     //     let (_stream, mut conn) = LrcpStream::construct(Arc::clone(&clock), server_addr).await;
     //     todo!()
     // }
+
+    #[test]
+    fn test_packet_buffer_overlapping() {
+        let mut buf = PacketBuffer::new();
+        assert_eq!(Ok(()), buf.write(0, Bytes::from_static(b"cou")));
+        assert_eq!(3, buf.highest_ack(), "highest ack adjusted");
+        assert_eq!(Ok(()), buf.write(0, Bytes::from_static(b"coucou")));
+        assert_eq!(6, buf.highest_ack(), "highest ack adjusted");
+        assert_eq!(Ok(()), buf.write(0, Bytes::from_static(b"couc")));
+        assert_eq!(6, buf.highest_ack(), "highest ack adjusted");
+
+        let limit = 1000;
+        assert_eq!(
+            Some((0, Bytes::from_static(b"coucou"))),
+            buf.read(limit),
+            "read biggest packet received so far"
+        );
+        assert_eq!(None, buf.read(limit), "consume everything");
+        assert_eq!(6, buf.highest_ack(), "highest ack adjusted");
+
+        assert_eq!(Ok(()), buf.write(0, Bytes::from_static(b"coucou world")));
+        assert_eq!(
+            Some((6, Bytes::from_static(b" world"))),
+            buf.read(limit),
+            "read the additional data"
+        );
+        assert_eq!(12, buf.highest_ack());
+    }
+
+    #[test]
+    fn test_packet_buffer_read_limit() {
+        let mut buf = PacketBuffer::new();
+        buf.write(0, Bytes::from_static(b"coucou")).unwrap();
+        buf.write(6, Bytes::from_static(b" world!")).unwrap();
+        assert_eq!(Some((0, Bytes::copy_from_slice(b"cou"))), buf.read(3));
+        assert_eq!(Some((3, Bytes::copy_from_slice(b"cou"))), buf.read(1000));
+        assert_eq!(Some((6, Bytes::copy_from_slice(b" wor"))), buf.read(4));
+        assert_eq!(Some((10, Bytes::copy_from_slice(b"ld!"))), buf.read(1000));
+        assert_eq!(13, buf.highest_ack());
+    }
 }
 
 mod parser {

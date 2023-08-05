@@ -7,5 +7,6 @@ pub mod mitm;
 pub mod speed;
 pub mod reversal;
 pub mod isl;
+pub mod job;
 
 pub(crate) mod utils;

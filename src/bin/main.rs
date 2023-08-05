@@ -22,6 +22,7 @@ enum Command {
     Reversal,
     ReversalClient,
     ISL,
+    Job,
 }
 
 #[tokio::main]
@@ -41,6 +42,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Command::Reversal => protohacker::reversal::main(addr).await?,
         Command::ReversalClient => protohacker::reversal::test_main(addr).await?,
         Command::ISL => protohacker::isl::main(addr).await?,
+        Command::Job => protohacker::job::main(addr).await?,
     }
 
     Ok(())

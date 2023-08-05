@@ -2,7 +2,7 @@ use std::{collections::HashMap, net::SocketAddr};
 
 use tokio::net::UdpSocket;
 
-type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+use crate::utils::BoxResult;
 
 pub async fn main(addr: SocketAddr) -> BoxResult<()> {
     let socket = UdpSocket::bind(addr).await?;

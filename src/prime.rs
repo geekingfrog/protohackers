@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+use crate::utils::BoxResult;
 
 #[derive(serde::Serialize, serde::Deserialize, Debug)]
 #[serde(tag = "method", content = "number")]

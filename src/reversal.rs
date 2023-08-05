@@ -28,8 +28,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-type BoxResult<T> = Result<T, BoxError>;
+use crate::utils::{BoxError, BoxResult};
 
 const MAX_MESSAGE_LEN: usize = 1000;
 const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
@@ -1330,14 +1329,7 @@ mod test {
     use pretty_assertions::assert_eq;
     use tokio::time::timeout;
 
-    /// make sure to abort a task on drop, so that it's easier to
-    /// do assertion in tests with less worry about cleaning up
-    struct AbortHdl<T>(JoinHandle<T>);
-    impl<T> Drop for AbortHdl<T> {
-        fn drop(&mut self) {
-            self.0.abort()
-        }
-    }
+    use crate::utils::AbortHdl;
 
     impl Clock {
         fn advance(&self, d: Duration) {

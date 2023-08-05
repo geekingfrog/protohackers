@@ -10,7 +10,7 @@ use tokio::{
     },
 };
 
-type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+use crate::utils::BoxResult;
 
 pub async fn main(addr: SocketAddr) -> BoxResult<()> {
     let listener = TcpListener::bind(addr).await?;

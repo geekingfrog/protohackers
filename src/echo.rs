@@ -3,7 +3,7 @@ use std::net::SocketAddr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 
-type BoxResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+use crate::utils::BoxResult;
 
 pub async fn main(addr: SocketAddr) -> BoxResult<()> {
     let listener = TcpListener::bind(addr).await?;

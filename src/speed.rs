@@ -19,8 +19,7 @@ use tokio::{
     task::JoinHandle,
 };
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-type BoxResult<T> = Result<T, BoxError>;
+use crate::utils::BoxResult;
 
 pub async fn main(addr: SocketAddr) -> BoxResult<()> {
     let listener = TcpListener::bind(addr).await?;
@@ -575,6 +574,7 @@ mod test {
 
     use super::*;
     use pretty_assertions::assert_eq;
+    use crate::utils::AbortHdl;
 
     #[tokio::test]
     async fn test_parse_two_messages() {
@@ -613,15 +613,6 @@ mod test {
             }
         }
         panic!("Couldn't find an available port !");
-    }
-
-    /// make sure to abort a task on drop, so that it's easier to
-    /// do assertion in tests with less worry about cleaning up
-    struct AbortHdl<T>(JoinHandle<T>);
-    impl<T> Drop for AbortHdl<T> {
-        fn drop(&mut self) {
-            self.0.abort()
-        }
     }
 
     #[tokio::test]

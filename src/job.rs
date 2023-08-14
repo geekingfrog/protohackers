@@ -14,8 +14,8 @@ use tokio::{
     sync::{broadcast, mpsc, oneshot},
 };
 
-type BoxError = Box<dyn std::error::Error + Send + Sync>;
-type BoxResult<T> = Result<T, BoxError>;
+use crate::utils::{BoxResult, BoxError, yolo_send};
+
 
 pub async fn main(addr: SocketAddr) -> BoxResult<()> {
     Server::bind(addr).await?.run().await?;
@@ -681,10 +681,6 @@ impl Waiters {
             }
         }
     }
-}
-
-fn yolo_send<T>(tx: oneshot::Sender<T>, x: T) {
-    if let Err(_) = tx.send(x) {}
 }
 
 async fn mb_await<F>(fut: &mut Option<F>) -> Option<F::Output>
